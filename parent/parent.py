@@ -147,6 +147,154 @@ def _ngram_counts(sequence, order):
     return collections.Counter(nwise(sequence, order))
 
 
+def parent_t_instance_level(package: tuple[list, list], smoothing=0.00001,
+                          max_order=4,
+                          entailment_fn=overlap_probability,
+                          mention_fn=_mention_probability):
+    """
+    Changes from parent_instance_level
+     - `package` tuple has no `references`
+     - `lambda_weight` arg removed as it is (essentially) always 1
+     - reduced code for entailment precision and entailment recall calculations to only account for table entailments
+    In the case of multiple references, score is the max among references.
+    """
+
+    prediction, table = package  # unpacking
+
+    # Compute recall against table fields
+    table_mention_probs = [mention_fn(entry, prediction)
+                     for entry in table]
+    table_rec = sum(table_mention_probs) / len(table) or smoothing
+
+    # Weighted ngram precisions and recalls for each order.
+    ngram_prec, ngram_rec = list(), list()
+    for order in range(1, max_order + 1):
+        # Collect n-grams and their entailment probabilities.
+        pred_ngram_counts = _ngram_counts(prediction, order)
+        pred_ngram_weights = {ngram: entailment_fn(ngram, table)
+                              for ngram in pred_ngram_counts}
+
+        # Precision.
+        numerator, denominator = 0., 0.
+        for ngram, count in pred_ngram_counts.items():
+            denominator += count
+            numerator += count * pred_ngram_weights[ngram]  # NOTE: CHANGED (only table entailment wrt w(g) now)
+        if denominator == 0.:
+            # Set precision to 0.
+            ngram_prec.append(0.0)
+        else:
+            ngram_prec.append(numerator / denominator)
+
+        # Recall.
+        # NOTE: CHANGED
+        # (reference Recall not calculated as we do not consider having reference entries)
+
+    # Smoothing.
+    for order in range(1, max_order):
+        if ngram_prec[order] == 0.:
+            ngram_prec[order] = smoothing
+
+    # Compute geometric averages of precision and recall for all orders.
+    w = 1. / max_order
+    if any(prec == 0. for prec in ngram_prec):
+        c_prec = 0
+    else:
+        sp = (w * math.log(p_i) for p_i in ngram_prec)
+        c_prec = math.exp(math.fsum(sp))
+
+    # Combine reference and table recalls.
+    # NOTE: CHANGED to calculate Recall only from tables (i.e. as if lambda_weight==1)
+    c_rec = table_rec
+
+    # F-score.
+    c_f = (2. * c_prec * c_rec) / (c_prec + c_rec + 1e-8)
+
+    return c_prec, c_rec, c_f
+
+
+def _parent_t(predictions,
+            tables,
+            smoothing=0.00001,
+            max_order=4,
+            entailment_fn=overlap_probability,
+            mention_fn=_mention_probability,
+            n_jobs=-1,
+            use_tqdm=True):
+    """
+    Metric for comparing predictions to given tables with no references.
+    Upgrade from original version (see first line of this file):
+    It now uses multiprocessing to go faster (minutes to seconds).
+
+    ARGS:
+    predictions: An iterator over tokenized predictions.
+                 Each prediction is a list.
+    tables: An iterator over the tables. Each table is a list of tuples, with
+            tuples being either (attribute, value) or (head, relation, tail).
+            The members of the tuples are assumed to be themselves tokenized
+            lists of strings. E.g.
+                `[(["name"], ["michael", "dahlquist"]),
+                  (["birth", "date"], ["december", "22", "1965"])]`
+            is one table in the (attribute, value) format with two entries.
+    smoothing: Float value to replace zero values of precision and recall.
+    max_order: Maximum order of the ngrams to use.
+    entailment_fn: A python function for computing the probability that an
+                   ngram is entailed by the table. Its signature should match
+                   that of `overlap_probability` above.
+    mention_fn: A python function for computing the probability that a
+                table entry is mentioned in the text. Its signature should
+                match that of `_mention_probability` above.
+    n_jobs: An int to specify number of parallel workers.
+            -1 to use all available.
+    use_tqdm: A boolean or str to specify whether or not to use tqm.
+              Usefull to deactivate when using the function in a notebook.
+              if str, use either 'classic' or 'notebook'. If boolean, defaults
+              to classic
+
+    RETURNS:
+    precision: Average precision of all predictions.
+    recall: Average recall of all predictions.
+    f1: Average F-scores of all predictions.
+    all_f_scores: List of all F-scores for each item.
+    """
+    # sanity check
+    references, _tqdm = validate_parent_args(predictions, None, tables,
+                                             1., smoothing, max_order,
+                                             use_tqdm)
+
+    precisions, recalls, all_f_scores = list(), list(), list()
+
+    _parent = partial(parent_t_instance_level,
+                      smoothing=smoothing,
+                      max_order=max_order,
+                      entailment_fn=entailment_fn,
+                      mention_fn=mention_fn)
+
+    n_jobs = mp.cpu_count() if n_jobs < 0 else n_jobs
+    if _tqdm is not None:
+        print(f'Using {n_jobs} processes, starting now.')
+    with mp.Pool(processes=n_jobs) as pool:
+        _iterable = pool.imap(
+            _parent,
+            zip(predictions, tables),
+            chunksize=n_jobs  # empirically seems to be the best, could be wrong though
+        )
+
+        if _tqdm is not None:
+            for p, r, f in _tqdm.tqdm(
+                    _iterable, total=len(tables), desc='Computing PARENT-T'):
+                precisions.append(p)
+                recalls.append(r)
+                all_f_scores.append(f)
+        else:
+
+            for p, r, f in _iterable:
+                precisions.append(p)
+                recalls.append(r)
+                all_f_scores.append(f)
+
+    return precisions, recalls, all_f_scores
+
+
 def parent_instance_level(package,
                           lambda_weight=0.5,
                           smoothing=0.00001,
@@ -156,16 +304,16 @@ def parent_instance_level(package,
     """
     In the case of multiple references, score is the max among references.
     """
-    
+
     prediction, references, table = package  # unpacking
-    
+
     # Compute recall against table fields (it doesn't depend on the ref).
     table_mention_probs = [mention_fn(entry, prediction)
-                     for entry in table]
+                           for entry in table]
     table_rec = sum(table_mention_probs) / len(table) or smoothing
-    
+
     multi_c_prec, multi_c_rec, multi_c_f = list(), list(), list()
-    
+
     for reference in references:
         # Weighted ngram precisions and recalls for each order.
         ngram_prec, ngram_rec = list(), list()
@@ -185,8 +333,8 @@ def parent_instance_level(package,
                 prob_ngram_in_ref = min(
                     1., float(ref_ngram_counts.get(ngram, 0) / count))
                 numerator += count * (
-                    prob_ngram_in_ref +
-                    (1. - prob_ngram_in_ref) * pred_ngram_weights[ngram])
+                        prob_ngram_in_ref +
+                        (1. - prob_ngram_in_ref) * pred_ngram_weights[ngram])
             if denominator == 0.:
                 # Set precision to 0.
                 ngram_prec.append(0.0)
@@ -225,14 +373,14 @@ def parent_instance_level(package,
         else:
             sr = [w * math.log(r_i) for r_i in ngram_rec]
             ref_rec = math.exp(math.fsum(sr))
-            
+
         # Combine reference and table recalls.
         if ref_rec == 0. or table_rec == 0.:
             c_rec = 0
         else:
             if lambda_weight is None:
                 lw = sum([mention_fn(entry, reference) for entry in table
-               ]) / len(table)
+                          ]) / len(table)
                 lw = 1. - lw
             else:
                 lw = lambda_weight
@@ -241,13 +389,12 @@ def parent_instance_level(package,
 
         # F-score.
         c_f = (2. * c_prec * c_rec) / (c_prec + c_rec + 1e-8)
-        
+
         multi_c_prec.append(c_prec)
         multi_c_rec.append(c_rec)
         multi_c_f.append(c_f)
-           
-    return max(multi_c_prec), max(multi_c_rec), max(multi_c_f)
 
+    return max(multi_c_prec), max(multi_c_rec), max(multi_c_f)
 
 def _parent(predictions,
             references,
@@ -342,6 +489,9 @@ def validate_parent_args(predictions, references, tables,
                          lambda_weight, smoothing, max_order, 
                          use_tqdm):
     assert len(predictions) == len(tables)
+
+    if references is None:
+        references = predictions
     
     # handling multi-references. Three ways to give refs:
     #  1) Solo refs, so a list of references
@@ -388,7 +538,7 @@ def validate_parent_args(predictions, references, tables,
 
 
 def parent(predictions,
-           references,
+           references: iter or None,
            tables,
            lambda_weight=0.5,
            smoothing=0.00001,
@@ -407,7 +557,8 @@ def parent(predictions,
     ARGS:
     predictions: An iterator over tokenized predictions.
                  Each prediction is a list.
-    references: An iterator over lists of tokenized references.
+    references: if None: calculate PARENT-T instead
+                else: An iterator over lists of tokenized references.
                 Each prediction can have multiple references.
     tables: An iterator over the tables. Each table is a list of tuples, with
             tuples being either (attribute, value) or (head, relation, tail).
@@ -435,18 +586,29 @@ def parent(predictions,
     RETURNS:
     precision, recall, f_score: either three floats or three lists of floats.
     """
-    
-    precisions, recalls, f_scores = _parent(
+
+    if references is None:
+        precisions, recalls, f_scores = _parent_t(
             predictions,
-            references,
             tables,
-            lambda_weight=lambda_weight,
             smoothing=smoothing,
             max_order=max_order,
             entailment_fn=entailment_fn,
             mention_fn=mention_fn,
             n_jobs=n_jobs,
             use_tqdm=use_tqdm)
+    else:
+        precisions, recalls, f_scores = _parent(
+                predictions,
+                references,
+                tables,
+                lambda_weight=lambda_weight,
+                smoothing=smoothing,
+                max_order=max_order,
+                entailment_fn=entailment_fn,
+                mention_fn=mention_fn,
+                n_jobs=n_jobs,
+                use_tqdm=use_tqdm)
         
     if avg_results:
         precisions = sum(precisions) / len(precisions)
@@ -454,6 +616,7 @@ def parent(predictions,
         f_scores = sum(f_scores) / len(f_scores)
 
     return precisions, recalls, f_scores
+
 
 def main():
 
@@ -513,10 +676,13 @@ def main():
         tables = [json.loads(line) for line in f if line.strip()]
 
     # args.references is a list of files
-    references = list()
-    for filename in args.references:
-        with open(filename, mode="r", encoding='utf8') as f:
-            references.append([line.strip().split() for line in f])
+    if args.references is None:
+        references = None
+    else:
+        references = list()
+        for filename in args.references:
+            with open(filename, mode="r", encoding='utf8') as f:
+                references.append([line.strip().split() for line in f])
         
     precisions, recalls, f_scores = parent(
         predictions,
